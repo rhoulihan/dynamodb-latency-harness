@@ -1,0 +1,15 @@
+target/
+*.class
+*.jar
+!.mvn/wrapper/*.jar
+results/
+*.jfr
+*.hlog
+*.bin
+*.bin.gz
+.aws-profile
+.superpowers/
+dependency-reduced-pom.xml
+scripts/.provisioned
+scripts/.run
+scripts/.preflight-ok
