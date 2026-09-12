@@ -1,0 +1,100 @@
+package com.rickh.ddblat.provider;
+
+/**
+ * Which DynamoDB-compatible service the harness is measuring, and what that service can tell us
+ * about itself.
+ *
+ * Both are reached with the same AWS SDK v2 client -- Oracle's Autonomous AI Database exposes a
+ * wire-compatible endpoint -- so the difference is not the protocol but the telemetry. Several
+ * of the harness's validity criteria are built on capacity the service reports back, and Oracle
+ * reports none of it (measured 2026-09-11, ADB 26ai: ConsumedCapacity null on PutItem, GetItem
+ * strong and eventual, Scan and BatchWriteItem).
+ *
+ * These flags exist so that a criterion which cannot be evaluated is recorded as
+ * NOT APPLICABLE rather than silently passing. A validity gate that quietly weakens itself on a
+ * platform it cannot inspect would be worse than no gate: it would certify numbers it never
+ * actually checked.
+ */
+public enum Provider {
+
+    /** Amazon DynamoDB. Reports consumed capacity; CloudWatch cross-check available. */
+    AWS(true, true, 400 * 1024, true),
+
+    /**
+     * Oracle Autonomous AI Database API for DynamoDB.
+     *
+     * Item-size ceiling is deliberately the same 400 KiB the harness models for AWS even though
+     * Oracle accepted a 450 KiB item in testing: the point of the comparison is identical
+     * payloads, so the stricter of the two limits is the one that binds.
+     */
+    OCI(false, false, 400 * 1024, false);
+
+    private final boolean reportsConsumedCapacity;
+    private final boolean hasCloudWatch;
+    private final int maxItemBytes;
+    private final boolean hasEventuallyConsistentReads;
+
+    Provider(boolean reportsConsumedCapacity, boolean hasCloudWatch, int maxItemBytes,
+             boolean hasEventuallyConsistentReads) {
+        this.reportsConsumedCapacity = reportsConsumedCapacity;
+        this.hasCloudWatch = hasCloudWatch;
+        this.maxItemBytes = maxItemBytes;
+        this.hasEventuallyConsistentReads = hasEventuallyConsistentReads;
+    }
+
+    /**
+     * Whether an eventually consistent read is a distinct operation on this service.
+     *
+     * DynamoDB serves eventually consistent reads from any replica at half the capacity cost.
+     * Oracle's Autonomous AI Database has no such path: ConsistentRead=false returns the same
+     * strongly consistent result over the same code path. Running the phase anyway would
+     * measure strong reads a second time and label them "eventual" -- and worse, the capacity
+     * model would charge 7.5 units for work that cost 15, crediting the achieved rate with
+     * twice the throughput actually delivered.
+     *
+     * So the phase is SKIPPED on such a provider rather than run and reported.
+     */
+    public boolean hasEventuallyConsistentReads() { return hasEventuallyConsistentReads; }
+
+    /** False when achieved throughput must be derived from the size model instead. */
+    public boolean reportsConsumedCapacity() { return reportsConsumedCapacity; }
+
+    /** False when the client-vs-service capacity cross-check cannot run at all. */
+    public boolean hasCloudWatch() { return hasCloudWatch; }
+
+    /** Largest single item the harness will attempt on this provider. */
+    public int maxItemBytes() { return maxItemBytes; }
+
+    /**
+     * Whether the size-model probe -- which compares predicted capacity against what the service
+     * actually billed -- can produce a verdict here. Without reported capacity there is nothing
+     * to compare against, so the probe is skipped rather than passed.
+     */
+    public boolean canVerifySizeModel() { return reportsConsumedCapacity; }
+
+
+    /**
+     * The AWS region name used to build the SigV4 credential scope when signing requests.
+     *
+     * Oracle's endpoint VALIDATES this and accepts only {@code us-west-2}, regardless of which
+     * OCI region the Autonomous Database actually lives in. Measured 2026-09-11 against an ADB
+     * in us-ashburn-1: us-west-2 authenticated; us-east-1, us-west-1, eu-west-1, ap-southeast-2
+     * and the database's own us-ashburn-1 all returned
+     * {@code 401 Invalid credential}. This is undocumented, so it is pinned here with the
+     * evidence rather than left as a mystery constant someone later "corrects" to the real
+     * region and breaks every OCI run.
+     */
+    public String signingRegion() {
+        return this == OCI ? "us-west-2" : null;   // null: AWS uses the configured region
+    }
+
+    public static Provider parse(String s) {
+        if (s == null || s.isBlank()) return AWS;
+        return switch (s.trim().toLowerCase()) {
+            case "aws", "dynamodb"  -> AWS;
+            case "oci", "oracle", "adb" -> OCI;
+            default -> throw new IllegalArgumentException(
+                "unknown provider '" + s + "': expected aws or oci");
+        };
+    }
+}

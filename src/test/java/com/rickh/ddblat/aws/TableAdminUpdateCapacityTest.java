@@ -89,4 +89,24 @@ class TableAdminUpdateCapacityTest {
             .hasMessageContaining("10");
         assertThat(ddb.updates).isEmpty();
     }
+
+    // ---- ensureCapacity: the re-run path -------------------------------------------------
+
+    @Test
+    void ensureCapacityIssuesTheUpdateThatCreateIfAbsentWouldNotHave() {
+        // A table left at 10/10 by a previous run's teardown. createIfAbsent would no-op and the
+        // await would then block on a capacity nothing had set.
+        FakeDdb ddb = new FakeDdb(10, 10);
+        new TableAdmin(ddb, "t").ensureCapacity(10, 30_000, java.time.Duration.ofSeconds(5));
+        assertThat(ddb.updates).containsExactly("10/30000");
+        assertThat(ddb.rcu).isEqualTo(10);
+        assertThat(ddb.wcu).isEqualTo(30_000);
+    }
+
+    @Test
+    void ensureCapacityIsAnEfficientNoOpWhenAlreadyThere() {
+        FakeDdb ddb = new FakeDdb(10, 30_000);
+        new TableAdmin(ddb, "t").ensureCapacity(10, 30_000, java.time.Duration.ofSeconds(5));
+        assertThat(ddb.updates).isEmpty();
+    }
 }

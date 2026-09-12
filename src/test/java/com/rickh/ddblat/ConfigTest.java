@@ -410,4 +410,69 @@ class ConfigTest {
             .isInstanceOf(IllegalArgumentException.class)
             .hasMessageContaining("manageCapacity");
     }
+
+    // ---- provider ----------------------------------------------------------------------------
+
+    @Test
+    void defaultsToAwsSoEveryPreExistingConfigIsUnchanged() throws Exception {
+        Config c = Config.load(write("""
+            table=t
+            region=us-east-1
+            itemCount=1024
+            loadWcu=100
+            readRcu=100
+            resultsDir=/tmp
+            """));
+        assertThat(c.provider()).isEqualTo(com.rickh.ddblat.provider.Provider.AWS);
+    }
+
+    @Test
+    void acceptsAnOciConfiguration() throws Exception {
+        Config c = Config.load(write("""
+            table=t
+            region=us-ashburn-1
+            itemCount=1024
+            loadWcu=100
+            readRcu=100
+            resultsDir=/tmp
+            provider=oci
+            ociDatabaseOcid=ocid1.autonomousdatabase.oc1.iad.exampledb
+            ociKeyFile=/home/x/.oci/keys.json
+            """));
+        assertThat(c.provider()).isEqualTo(com.rickh.ddblat.provider.Provider.OCI);
+        assertThat(c.ociDatabaseOcid()).isEqualTo("ocid1.autonomousdatabase.oc1.iad.exampledb");
+        assertThat(c.ociKeyFile().toString()).isEqualTo("/home/x/.oci/keys.json");
+    }
+
+    @Test
+    void ociWithoutADatabaseOcidIsRejectedRatherThanProducingABadEndpoint() throws Exception {
+        assertThatThrownBy(() -> Config.load(write("""
+            table=t
+            region=us-ashburn-1
+            itemCount=1024
+            loadWcu=100
+            readRcu=100
+            resultsDir=/tmp
+            provider=oci
+            ociKeyFile=/home/x/.oci/keys.json
+            """)))
+            .isInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("ociDatabaseOcid");
+    }
+
+    @Test
+    void ociWithoutAKeyFileIsRejected() throws Exception {
+        assertThatThrownBy(() -> Config.load(write("""
+            table=t
+            region=us-ashburn-1
+            itemCount=1024
+            loadWcu=100
+            readRcu=100
+            resultsDir=/tmp
+            provider=oci
+            ociDatabaseOcid=ocid1.autonomousdatabase.oc1.iad.exampledb
+            """)))
+            .isInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("ociKeyFile");
+    }
 }

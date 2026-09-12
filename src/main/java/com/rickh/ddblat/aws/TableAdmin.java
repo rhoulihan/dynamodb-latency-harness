@@ -41,6 +41,22 @@ public final class TableAdmin {
     }
 
     /**
+     * Brings an EXISTING table to the given capacity and waits for it, issuing the UpdateTable
+     * that gets it there.
+     *
+     * This exists because the obvious-looking sequence is wrong: {@code createIfAbsent} is a
+     * no-op on a table that already exists, so pairing it with {@code awaitActiveWithCapacity}
+     * waits for a capacity that nothing ever set. A run whose teardown had reset the table to
+     * 10/10 -- which is every run's teardown -- would then block until the await timed out.
+     * Latent on AWS, where production runs always create a fresh table; immediately fatal on
+     * any re-run against an existing one.
+     */
+    public void ensureCapacity(long rcu, long wcu, Duration timeout) {
+        updateCapacity(rcu, wcu);          // no-op safe: skips when already at target
+        awaitActiveWithCapacity(rcu, wcu, timeout);
+    }
+
+    /**
      * Sets provisioned capacity, treating "already there" as success.
      * <p>
      * DynamoDB rejects an UpdateTable that requests the capacity the table already has

@@ -36,7 +36,14 @@ public final class GetWorkload implements Workload {
                 .consistentRead(consistentRead)
                 .returnConsumedCapacity(ReturnConsumedCapacity.TOTAL));
             long dt = System.nanoTime() - t0;
-            double cu = resp.consumedCapacity() == null ? 0 : resp.consumedCapacity().capacityUnits();
+            // Oracle's DynamoDB-compatible API returns a null ConsumedCapacity on every
+            // operation even with ReturnConsumedCapacity=TOTAL (measured 2026-09-11, ADB 26ai).
+            // Reporting that as 0 would make CapacityMeter see zero achieved throughput and the
+            // ramp chase a number that can never rise. The size model is exact here -- fixed
+            // 59 KiB items, verified against real billed capacity at 0.0 WCU deviation -- so
+            // falling back to it is a substitution, not an estimate. A capacity the service
+            // DOES report always wins.
+            double cu = capacityOrModel(resp.consumedCapacity(), index);
             // hasItem() is the SDK-idiomatic miss check (true only when "Item" was actually
             // present in the response, not merely an empty-but-set map) -- see task-17: a
             // miss must be counted as a miss, never mistaken for a 0-byte hit.
@@ -64,5 +71,16 @@ public final class GetWorkload implements Workload {
     @Override
     public byte phaseId() {
         return phaseId;
+    }
+
+    /**
+     * Oracle returns a ConsumedCapacity OBJECT whose capacityUnits() field is null -- not a null
+     * object. Checking only the object throws NullPointerException on unboxing, which the
+     * workload then classifies as a generic error, so every request "fails" while the service is
+     * actually answering correctly. Both shapes have to be treated as "not reported".
+     */
+    private double capacityOrModel(ConsumedCapacity cc, int index) {
+        if (cc == null || cc.capacityUnits() == null) return estimatedCapacityUnits(index);
+        return cc.capacityUnits();
     }
 }

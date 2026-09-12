@@ -10,6 +10,8 @@ import com.rickh.ddblat.report.JfrDump;
 import com.rickh.ddblat.report.SummaryWriter;
 import com.rickh.ddblat.worker.*;
 import software.amazon.awssdk.regions.Region;
+import com.rickh.ddblat.provider.OciCredentials;
+import com.rickh.ddblat.provider.Provider;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
 import software.amazon.awssdk.services.ec2.Ec2Client;
 
@@ -95,7 +97,22 @@ public final class Main {
         KeySpace keys = new KeySpace(cfg.itemCount());
         ItemTemplateFactory factory = new ItemTemplateFactory(20260908L);
         ClientSettings settings = ClientSettings.forThreads(cfg.maxThreads());
-        DynamoDbClient ddb = DynamoClientFactory.create(Region.of(cfg.region()), settings, null);
+        // Both providers speak the same wire protocol, so the only differences are the endpoint
+        // and where credentials come from. Oracle's Autonomous AI Database exposes a
+        // DynamoDB-compatible key-value store endpoint and mints AWS-shaped access keys for it;
+        // AWS uses the default provider chain and the SDK's own endpoint resolution.
+        java.net.URI endpoint = null;
+        software.amazon.awssdk.auth.credentials.AwsCredentialsProvider creds = null;
+        if (cfg.provider() == Provider.OCI) {
+            endpoint = java.net.URI.create(
+                OciCredentials.endpointFor(cfg.region(), cfg.ociDatabaseOcid()));
+            creds = OciCredentials.fromKeyFile(cfg.ociKeyFile());
+            System.out.println("PROVIDER: OCI -- " + endpoint);
+        } else {
+            System.out.println("PROVIDER: AWS -- " + cfg.region());
+        }
+        DynamoDbClient ddb = DynamoClientFactory.create(
+            Region.of(awsRegionFor(cfg)), settings, endpoint, creds);
         TableAdmin admin = new TableAdmin(ddb, cfg.table());
         RecordWriter writer = new RecordWriter(
             cfg.resultsDir().resolve("requests.bin.gz"), cfg.maxThreads() * 8, 2_730);
@@ -151,8 +168,9 @@ public final class Main {
                 System.out.println("LOAD: table already exists -- its partitioning is whatever "
                     + "it already was; the pre-split optimisation only applies at creation time, "
                     + "so it is not re-applied. Raising to " + cfg.loadWcu() + " WCU / 10 RCU");
-                admin.createIfAbsent(10, cfg.loadWcu());   // no-op: table exists
-                admin.awaitActiveWithCapacity(10, cfg.loadWcu(), Duration.ofMinutes(10));
+                // ensureCapacity, not createIfAbsent+await: the table exists, so the create
+                // is a no-op and nothing would ever set the capacity being waited for.
+                admin.ensureCapacity(10, cfg.loadWcu(), Duration.ofMinutes(10));
             } else {
                 long presplitPartitions = cfg.presplitWcu() / 1000;
                 System.out.println("LOAD: creating table at " + cfg.presplitWcu() + " WCU / 10 "
@@ -172,7 +190,16 @@ public final class Main {
                 }
             }
             if (!cfg.skipLoad()) {
-                SizeModelProbe.validate(ddb, cfg.table(), keys, factory, 100, cfg.resultsDir());
+                // The probe compares predicted capacity against what the service actually
+                // billed. Oracle reports no consumed capacity at all, so there is nothing to
+                // compare against -- skipped explicitly rather than allowed to "pass" vacuously.
+                if (cfg.provider().canVerifySizeModel()) {
+                    SizeModelProbe.validate(ddb, cfg.table(), keys, factory, 100, cfg.resultsDir());
+                } else {
+                    System.out.println("SIZE-MODEL-VALIDATION skipped: " + cfg.provider()
+                        + " does not report ConsumedCapacity, so predicted-vs-billed cannot be "
+                        + "checked. Item sizes are still deterministic from the model.");
+                }
 
                 // The checkpoint file lives outside resultsDir specifically so it survives a wipe
                 // between runs (see Config.checkpointFile), but the table itself does NOT survive
@@ -253,10 +280,19 @@ public final class Main {
                 null));
 
             // ---- R-B: eventually consistent ----
-            summaries.add(runPhase("R-B-eventual", cfg, ddb, writer, cpu, runStart,
-                new GetWorkload(ddb, cfg.table(), keys, false, RB_RAMP),
-                rbSource, cfg.readRcu(), RB_RAMP, RB_WIN, cfg.windowDuration(),
-                null));
+            // Only where "eventually consistent" is a distinct operation. On a provider without
+            // one, this phase would re-measure strong reads under a misleading name and mis-bill
+            // them at half cost -- see Provider.hasEventuallyConsistentReads().
+            if (cfg.provider().hasEventuallyConsistentReads()) {
+                summaries.add(runPhase("R-B-eventual", cfg, ddb, writer, cpu, runStart,
+                    new GetWorkload(ddb, cfg.table(), keys, false, RB_RAMP),
+                    rbSource, cfg.readRcu(), RB_RAMP, RB_WIN, cfg.windowDuration(),
+                    null));
+            } else {
+                System.out.println("R-B-eventual: SKIPPED -- " + cfg.provider()
+                    + " has no eventually consistent read path; ConsistentRead=false returns the "
+                    + "same strongly consistent result, so the phase would measure R-A twice.");
+            }
 
             success = true;
         } finally {
@@ -425,5 +461,15 @@ public final class Main {
             return sun::getCpuLoad;
         }
         return () -> 0.0;
+    }
+
+    /**
+     * The SDK insists on a Region even when the endpoint is overridden. Oracle does NOT ignore
+     * it -- the endpoint validates the SigV4 credential scope and accepts only one specific
+     * value. See Provider.signingRegion() for the measurement behind that.
+     */
+    private static String awsRegionFor(Config cfg) {
+        String signing = cfg.provider().signingRegion();
+        return signing != null ? signing : cfg.region();
     }
 }

@@ -6,13 +6,16 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Properties;
 
+import com.rickh.ddblat.provider.Provider;
+
 public record Config(String table, String region, int itemCount, long loadWcu, long presplitWcu,
                      long readRcu, double targetFraction, int readSegmentsTotal, int readSegmentsUsed,
                      Duration windowDuration, long warmNanos,
                      long minRampNanos, int initialThreads, int maxThreads,
                      Path resultsDir, String s3Bucket, String s3Prefix,
                      Path checkpointFile, boolean selfStop, Path harnessLogFile,
-                     boolean skipLoad, boolean manageCapacity) {
+                     boolean skipLoad, boolean manageCapacity,
+                     Provider provider, String ociDatabaseOcid, Path ociKeyFile) {
 
     public static Config load(Path file) throws IOException {
         Properties p = new Properties();
@@ -118,6 +121,28 @@ public record Config(String table, String region, int itemCount, long loadWcu, l
                 + "whole series.");
         }
 
+        // --- provider ---------------------------------------------------------------------
+        // Defaults to AWS so every pre-existing config file behaves exactly as before. OCI means
+        // Oracle's Autonomous AI Database API for DynamoDB, reached with the same AWS SDK client
+        // pointed at a different endpoint -- see Provider for what that service can and cannot
+        // report back about itself.
+        Provider provider = Provider.parse(p.getProperty("provider"));
+        String ociDatabaseOcid = p.getProperty("ociDatabaseOcid");
+        String ociKeyFileRaw = p.getProperty("ociKeyFile");
+        if (provider == Provider.OCI) {
+            if (ociDatabaseOcid == null || ociDatabaseOcid.isBlank()) {
+                throw new IllegalArgumentException(
+                    "provider=oci requires ociDatabaseOcid (the Autonomous Database OCID); the "
+                    + "key-value store endpoint is built from it and the region");
+            }
+            if (ociKeyFileRaw == null || ociKeyFileRaw.isBlank()) {
+                throw new IllegalArgumentException(
+                    "provider=oci requires ociKeyFile: the JSON returned by "
+                    + "POST /adb/auth/v1/databases/{ocid}/accesskeys");
+            }
+        }
+        Path ociKeyFile = ociKeyFileRaw == null ? null : Path.of(ociKeyFileRaw);
+
         return new Config(
             table, region, itemCount,
             loadWcu, presplitWcu,
@@ -142,7 +167,8 @@ public record Config(String table, String region, int itemCount, long loadWcu, l
             // (rather than hardcoded) because the default is instance-filesystem-specific and
             // every test needs a harmless value that will simply never exist.
             Path.of(p.getProperty("harnessLogFile", "/var/log/ddblat.log")),
-            skipLoad, manageCapacity);
+            skipLoad, manageCapacity,
+            provider, ociDatabaseOcid, ociKeyFile);
     }
 
     private static String require(Properties p, String key) {
