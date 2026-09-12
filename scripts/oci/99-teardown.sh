@@ -39,9 +39,30 @@ if (( DESTROY )); then
     [[ "$st" == "TERMINATED" || -z "$st" ]] && break
     sleep 10
   done
-  [[ -n "${SUBNET_ID:-}" ]] && o network subnet delete --subnet-id "$SUBNET_ID" --force >/dev/null 2>&1 && log "subnet deleted"
-  [[ -n "${IGW_ID:-}"    ]] && o network internet-gateway delete --ig-id "$IGW_ID" --force >/dev/null 2>&1 && log "gateway deleted"
-  [[ -n "${VCN_ID:-}"    ]] && o network vcn delete --vcn-id "$VCN_ID" --force >/dev/null 2>&1 && log "vcn deleted"
+  # Order and route rules matter. An internet gateway cannot be deleted while a route table
+  # still references it, and the VCN cannot be deleted while the gateway exists -- so clearing
+  # the default route table first is not optional. Getting this wrong leaves the VCN behind
+  # silently, which is exactly what happened the first time this script was run for real.
+  drop() {                      # drop <label> <command...>: report the real outcome, never assume
+    local label="$1"; shift
+    local out; out=$("$@" 2>&1)
+    if [[ -z "$out" ]]; then log "$label deleted"
+    else log "$label NOT deleted: $(tr -d '\n' <<<"$out" | cut -c1-140)"; fi
+  }
+
+  if [[ -n "${SUBNET_ID:-}" ]]; then drop subnet o network subnet delete --subnet-id "$SUBNET_ID" --force; fi
+
+  if [[ -n "${VCN_ID:-}" ]]; then
+    RT=$(o network vcn get --vcn-id "$VCN_ID" --query 'data."default-route-table-id"' --raw-output 2>/dev/null)
+    if [[ -n "$RT" ]]; then
+      o network route-table update --rt-id "$RT" --force --route-rules '[]' >/dev/null 2>&1 \
+        && log "route rules cleared" || log "could not clear route rules — gateway delete may fail"
+    fi
+  fi
+
+  if [[ -n "${IGW_ID:-}" ]]; then drop gateway o network internet-gateway delete --ig-id "$IGW_ID" --force; fi
+  sleep 10
+  if [[ -n "${VCN_ID:-}" ]]; then drop vcn o network vcn delete --vcn-id "$VCN_ID" --force; fi
   rm -f "$STATE_FILE" "$OCI_SCRIPTS_DIR/.preflight-ok"
   log "destroy complete"
 else
