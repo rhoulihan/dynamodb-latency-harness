@@ -127,6 +127,10 @@ exactly this.
 
 ## Quick start
 
+**For a step-by-step operator guide — prerequisites, quota gates, cost control, reading the
+results, teardown verification and troubleshooting — see [`docs/RUNBOOK.md`](docs/RUNBOOK.md).**
+This section is the short form.
+
 Requires Java 21+ and Maven.
 
 ### AWS
@@ -268,7 +272,8 @@ the dataset, and an `ensureCapacity` path that waited ten minutes for a capacity
 That last one was latent on AWS for the whole project and only surfaced on the first re-run
 against an existing table.
 
-Design spec: [`docs/design-spec.md`](docs/design-spec.md).
+Design spec: [`docs/design-spec.md`](docs/design-spec.md). Operator runbook:
+[`docs/RUNBOOK.md`](docs/RUNBOOK.md).
 
 ---
 
