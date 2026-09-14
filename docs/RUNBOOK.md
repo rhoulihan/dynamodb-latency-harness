@@ -6,8 +6,13 @@ The [README](../README.md) explains what the harness measures and why. This docu
 sequence you follow. It assumes no prior context — if you can clone the repo and have an account
 with capacity, you can produce a valid measurement.
 
-**Read §1 and §7 before you start anything.** §1 is what the run costs, §7 is how to stop paying
+**Read §1 and §8 before you start anything.** §1 is what the run costs, §8 is how to stop paying
 for it. Everything between them is the happy path.
+
+**If you cannot run the provisioning scripts** — a locked-down account, no IAM write, an existing
+instance you must use, or infrastructure-as-code that owns your estate — skip to
+**[§6, Bring your own infrastructure](#6-bring-your-own-infrastructure)**. It states the contract
+the harness actually needs, on both clouds, rather than what the scripts happen to build.
 
 ---
 
@@ -71,7 +76,8 @@ before you spend anything.
 - **oci-cli.** `brew install oci-cli` or Oracle's installer.
 - **An API signing key** configured as a profile in `~/.oci/config`. See §5.1 — the console gives
   you the config block to paste.
-- **A tenancy with paid Autonomous Database entitlement.** Developer tier does not work; see §8.
+- **A tenancy with paid Autonomous Database entitlement.** Developer tier does not work — see
+  §6.5, which explains what it does instead of failing.
 
 ---
 
@@ -192,8 +198,8 @@ Each run gets its own directory under `results/series-*/`.
 ## 5. OCI — the run
 
 The same harness, the same workload, pointed at Oracle Autonomous AI Database's
-DynamoDB-compatible API. Read §8 first: several behaviours differ and two of them will silently
-waste your afternoon.
+DynamoDB-compatible API. **Read §6.5 first** — several behaviours differ from DynamoDB, and two
+of them fail silently rather than erroring.
 
 ### 5.1 Credentials — two different ones
 
@@ -228,7 +234,7 @@ openssl rsa -pubout -in ~/.oci/ddblat_api_key.pem   # paste this into the consol
 
 `10-provision.sh` generates the database ADMIN password itself, stores it `0600` at
 `~/.oci/ddblat-adb-admin.txt`, and never prints it. It enables the DynamoDB API via a tag
-**update** (not at create time — see §8) and waits out the ten-minute activation.
+**update** (not at create time — see §6.5) and waits out the ten-minute activation.
 
 Tunable with environment variables, all with working defaults:
 
@@ -251,7 +257,330 @@ ssh -i ~/.ssh/ddblat_oci opc@<instance-ip> 'tail -f ~/ddblat.log'
 
 ---
 
-## 6. Reading the results
+## 6. Bring your own infrastructure
+
+The scripts in §4 and §5 create everything. If you cannot — a locked-down account, no IAM
+write, an existing bastion you must use, or infrastructure-as-code that owns your estate — the
+harness does not need them. **It needs a table and a machine in the same region.** Everything
+else the scripts build is convenience.
+
+This section is the contract: what must exist, what the harness will do to it, and what it costs
+you in measurement validity if you deviate.
+
+### 6.1 The minimum
+
+The harness reads a properties file and needs exactly **six** keys. Everything else has a
+working default:
+
+```properties
+table=my-latency-table
+region=us-east-1
+itemCount=2097152        # must be a power of two
+loadWcu=30000
+readRcu=40000
+resultsDir=/var/tmp/ddblat-results
+```
+
+Run it directly:
+
+```bash
+mvn package
+java -XX:+UseZGC -Xms24g -Xmx24g -XX:+AlwaysPreTouch      -XX:StartFlightRecording=settings=profile,filename=$PWD/results/run.jfr,maxsize=2G      -jar target/ddblat.jar --config my.properties
+```
+
+Heap size should be comfortably above `maxThreads × 8 × 2,730 × 24 bytes` of record buffers plus
+the item templates; 24 GiB is what the reference runs used and is generous. `AlwaysPreTouch`
+costs about 15 s at startup and keeps page faults out of the measurement window.
+
+**Neither S3 nor EC2 is required.** `s3Bucket` defaults to blank, and a blank bucket skips the
+upload silently; `selfStop` defaults to `false`. Results are written to `resultsDir` regardless
+— collect them however you like.
+
+### 6.2 The credential contract
+
+At runtime the harness makes exactly seven DynamoDB calls: `CreateTable`, `DescribeTable`,
+`UpdateTable`, `PutItem`, `GetItem`, `Scan`, `DeleteTable`. That is the whole API surface. The
+minimum policy:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": [
+      "dynamodb:CreateTable",
+      "dynamodb:DescribeTable",
+      "dynamodb:UpdateTable",
+      "dynamodb:PutItem",
+      "dynamodb:GetItem",
+      "dynamodb:Scan"
+    ],
+    "Resource": "arn:aws:dynamodb:REGION:ACCOUNT:table/YOUR-TABLE"
+  }]
+}
+```
+
+Three optional additions, each buying one feature:
+
+| Add | Enables |
+|---|---|
+| `s3:PutObject`, `s3:GetObject`, `s3:AbortMultipartUpload` on `bucket/prefix/*` | `s3Bucket` upload of results |
+| `ec2:StopInstances` on the instance's **own** ARN | `selfStop=true` |
+| `cloudwatch:GetMetricData` (Resource `*` — the API has no resource-level scoping) | the post-hoc `CloudWatchCrossCheck` tool |
+
+`dynamodb:Scan` is needed **only** if you set `readSegmentsTotal` to concentrate reads on a
+subset of partitions. `dynamodb:DeleteTable` is used by the test suite, not by a run.
+
+**Credentials resolve through the default AWS provider chain.** An instance profile, a task role,
+`AWS_PROFILE`, or environment variables all work. The harness never reads a credential file
+itself on the AWS path.
+
+### 6.3 If the table already exists
+
+The harness handles both cases, and the difference matters:
+
+| | |
+|---|---|
+| **Table absent** | It creates the table at `presplitWcu` (default: `loadWcu`), waits for ACTIVE, then drops to `loadWcu` if they differ |
+| **Table exists** | It **does not** re-create or re-shape it. It calls `ensureCapacity` to raise it to the configured level and waits |
+
+**Pre-splitting only works at creation time.** Partitions are allocated from provisioned capacity
+when a table is created and never merge, so a table you created at 100 WCU has few partitions
+forever — and running a 30,000 WCU load against it will throttle no matter what the config says.
+If you are bringing your own table and want the partition behaviour the reference runs had,
+create it at 40,000 WCU and let the harness drop it.
+
+Your table must be:
+
+- **Partition key only**, named `pk`, type `S`. No sort key.
+- **Provisioned** billing mode — the harness sets RCU/WCU directly, and on-demand has no
+  capacity to set.
+- **No GSI, LSI, streams or TTL.** None are used; all of them consume capacity and would
+  contaminate the measurement.
+
+Set `manageCapacity=false` if you do not want the harness changing capacity at all. It will then
+**verify** the table is already at the configured level and fail loudly if it is not — not
+managing capacity must not become not checking it, since driving 36,000 RCU/s at a 10-RCU table
+throttles from the first request and fills the window with retry latencies.
+
+### 6.4 Your client machine
+
+This is where deviating actually costs you.
+
+| Requirement | Why |
+|---|---|
+| **Same region as the table. Same AZ if you can** | The reference runs measured TCP connect at 0.9 ms and TLS at 9 ms in-region, against 45 ms and 104 ms from a workstation. A cross-region client measures your network, not the service |
+| **Enough cores to not be the bottleneck** | The validity gate fails any window where client CPU exceeds 70%. The reference client was 16 vCPU and peaked near 10% |
+| **A VPC endpoint for DynamoDB, ideally** | Keeps traffic off NAT and the internet gateway. Not required, but a NAT gateway in the path is a latency and cost term you did not intend to measure |
+| **Java 21+** | |
+
+Check the region assumption before a long run:
+
+```bash
+# from the client, against your regional endpoint
+for i in 1 2 3; do
+  curl -so /dev/null -w "connect=%{time_connect}s tls=%{time_appconnect}s
+" \
+    https://dynamodb.us-east-1.amazonaws.com/
+done
+```
+
+Single-digit milliseconds means you are in-region. Tens of milliseconds means you are about to
+measure the internet.
+
+### 6.5 Bringing your own OCI infrastructure
+
+Oracle's endpoint is wire-compatible, so the harness talks to it with the same AWS SDK client.
+What differs is everything around it — and four of those differences are undocumented and will
+cost you an afternoon each if you meet them cold.
+
+#### The database
+
+| Requirement | Consequence if you get it wrong |
+|---|---|
+| **Transaction Processing** workload | Other workload types do not offer the DynamoDB API |
+| **Not** Autonomous Database for Developers | `CreateTable` returns HTTP 200 with `TableStatus=CREATING` and **silently never creates the table.** No error in the response, in work requests, or in `lifecycle-details`. Verified by building an otherwise identical non-dev database, where the same call succeeds in five seconds |
+| **Not** in an elastic pool | The API is unavailable |
+| Sized to your target capacity | See the ceiling below — this is not a free parameter |
+
+Provision one however your organisation does it. The reference used 64 ECPU with 256 GB of
+storage; the CLI form is:
+
+```bash
+oci db autonomous-database create \
+  --compartment-id "$COMPARTMENT" --db-name ddblatprod --display-name ddblat-adb \
+  --db-workload OLTP --compute-model ECPU --compute-count 64 \
+  --data-storage-size-in-gbs 256 --license-model LICENSE_INCLUDED \
+  --admin-password "$PW" --wait-for-state AVAILABLE
+```
+
+Note the absence of `--is-dev-tier`. That is deliberate and it is the single most important flag
+on this page.
+
+#### Enabling the DynamoDB API
+
+Apply a free-form tag — **as an update to an existing database, never in the create call:**
+
+```bash
+oci db autonomous-database update --autonomous-database-id "$ADB_ID" --force \
+  --freeform-tags '{"adb$feature":"{\"name\":\"DynamoDB_API\",\"enable\":true}"}'
+```
+
+Lifecycle goes to `UPDATING`, a work request appears, and activation takes **up to ten minutes**.
+
+Passed at create time the tag persists on the resource — `DescribeAutonomousDatabase` shows it —
+and fires **no enablement work request at all**. The feature is never provisioned while
+everything looks correct. Check for the work request rather than for the tag:
+
+```bash
+oci work-requests work-request list --compartment-id "$COMPARTMENT" \
+  --query 'data[?contains("operation-type", `Tag`)].{op:"operation-type",status:status}' \
+  --output table
+```
+
+#### The access key
+
+There is no console UI for this. POST with database Basic auth from a user holding `PDB_DBA`
+(normally `ADMIN`):
+
+```bash
+curl -sS -X POST \
+  "https://dataaccess.adb.${REGION}.oraclecloudapps.com/adb/auth/v1/databases/${ADB_ID}/accesskeys" \
+  --user "ADMIN:${DB_PASSWORD}" --header 'Content-Type: application/json' \
+  --data-raw '{"name":"ddblat","permissions":[{"actions":["ADMIN_ANY"]}],"expiration_minutes":1440}' \
+  > ~/.oci/ddblat-keys.json && chmod 600 ~/.oci/ddblat-keys.json
+```
+
+**Run that in your own shell**, not through an agent, a CI job with logging, or a shared
+terminal: the request carries the database password and the response body carries the secret.
+Redirect it straight to a `0600` file and never echo it.
+
+`expiration_minutes` is optional; omit it for a non-expiring key. `ADMIN_ANY` is the simplest
+grant — narrower options are `CREATE_TABLE`, `READ_ANY`, `READ_WRITE_ANY`, and per-table forms.
+
+The response is AWS-shaped:
+
+```json
+{"access_key_id": "ak_…", "secret_access_key": "…", "expiration_time": "…"}
+```
+
+#### The capacity ceiling — plan around it
+
+**Provisioned capacity caps near 9,000 units, and the cap is cumulative across every table in
+the database.** Above it, `CreateTable` returns
+`ValidationException: Provisioned throughput exceeds maximum capacity`.
+
+Measured on an **empty** 64-ECPU database: 9,000 accepted; 10,000, 11,000, 12,000, 16,000,
+20,000 and 30,000 all rejected. Scaling the database from 48 to 64 ECPUs barely moved the
+ceiling, so this is a service cap and not a sizing problem — **you cannot buy past it.**
+
+Two practical consequences:
+
+1. **Size your config to the ceiling.** `loadWcu=9000` and `readRcu=9000` is the reference. A
+   config carrying DynamoDB's 40,000 will fail at `CreateTable`.
+2. **Delete leftover tables before sizing a new one.** They consume the same budget. A
+   half-finished experiment holding 6,000 units leaves you 3,000.
+
+```bash
+# what is currently committed
+aws dynamodb list-tables --endpoint-url "$ENDPOINT" --region us-west-2   # signing region, see below
+```
+
+#### Client configuration
+
+Four keys instead of two:
+
+```properties
+provider=oci
+region=us-ashburn-1
+ociDatabaseOcid=ocid1.autonomousdatabase.oc1.iad.YOUR-OCID
+ociKeyFile=/home/opc/ddblat-keys.json
+```
+
+The endpoint is derived: `https://dataaccess.adb.{region}.oraclecloudapps.com/adb/keyvaluestore/v1/{ocid}`
+
+**The SigV4 signing region must be `us-west-2`**, whatever region the database lives in. The
+harness pins this internally and you should not override it — but if you write your own client
+against the same endpoint, this is the first thing to get right. Every other region returns
+`401 Invalid credential`, including the database's own, and the error blames the credential, so
+the natural fix of re-minting the key never works. Verified against six regions.
+
+#### The client machine
+
+Same requirement as AWS: **in the same region as the database.** The reference used a
+`VM.Standard.E5.Flex` with 8 OCPU and 32 GB — 16 vCPU-equivalent, matching the AWS client.
+
+The measured difference is stark. From a workstation over the internet: TCP connect **45 ms**,
+TLS **104 ms**. From an instance in `us-ashburn-1` alongside the database: **0.9 ms** and
+**9 ms**. A 60 ms P50 measured from a laptop is almost entirely WAN.
+
+```bash
+# run this on your client before trusting any number it produces
+for i in 1 2 3; do
+  curl -so /dev/null -w "connect=%{time_connect}s tls=%{time_appconnect}s\n" \
+    "https://dataaccess.adb.${REGION}.oraclecloudapps.com/"
+done
+```
+
+Unlike the AWS path there is no SSM equivalent in use here — the scripted path reaches the client
+over plain SSH on a public subnet with ingress restricted to port 22. If your organisation
+requires a bastion or private subnet, nothing in the harness cares; it only needs outbound HTTPS
+to the endpoint.
+
+#### Expect a wider thread pool
+
+Worth knowing before you size the client: at Oracle's higher per-request latency the saturation
+detector grows the pool. In the reference run the write phase ramped **32 → 48 → 64 → 80**
+threads to hold its target, where the AWS run held 458 writes/s on 32.
+
+That is arithmetic, not a defect — a synchronous thread completes `1000 / mean_ms` requests per
+second, so 13.5 ms per request yields ~74/s against ~176/s at 5.7 ms. Holding any given offered
+rate takes a proportionally wider pool. Leave `maxThreads` at its default of 256 and let the
+detector do its work; CPU stayed near 11% throughout.
+
+#### What the harness will not do on OCI
+
+Three validity checks cannot run, and each is recorded as **not applicable** rather than passed:
+
+| | |
+|---|---|
+| Size-model probe | Oracle reports no consumed capacity, so predicted-vs-billed has nothing to compare against |
+| CloudWatch cross-check | No equivalent metric is published |
+| Eventually-consistent read phase | **Skipped entirely.** `ConsistentRead=false` returns the same strongly consistent result, so running it would re-measure the strong phase under a misleading label *and* charge it at half cost, inflating achieved throughput 2× |
+
+Achieved throughput is derived from the size model instead of from reported capacity. That is
+exact rather than approximate here, because every item is a fixed 59 KiB.
+
+### 6.6 What you give up
+
+Running without the scripts costs you four things. None are fatal; all are worth knowing.
+
+1. **The quota gate does not run.** Nothing checks that your account admits 40,000 capacity units
+   before you start a two-hour load. Run `00-preflight-quota.sh` on its own even if you provision
+   everything else yourself — it only needs the CLI and reads quotas.
+2. **No automatic teardown.** Capacity stays where the run left it. The harness drops the table
+   to 10/10 in its own `finally` block, but nothing stops your instance or deletes anything.
+3. **No S3 upload unless you configure it.** If the instance is ephemeral, results die with it.
+   Set `s3Bucket`, or collect `resultsDir` before terminating.
+4. **The CloudWatch cross-check is manual.** It is a post-hoc tool either way, but the scripted
+   path leaves the artifacts where it expects them.
+
+### 6.7 Verify your setup before spending two hours
+
+Run the smoke config against your own infrastructure first. It is about a dollar and exercises
+every code path a production run uses:
+
+```bash
+java -XX:+UseZGC -Xms4g -Xmx4g -jar target/ddblat.jar --config conf/smoke.properties
+```
+
+You are looking for three things in the log: `PROVIDER:` naming the right service and endpoint,
+`rampState=HOLDING` with `achievedCUs` tracking target, and a phase line reading `valid=true`. If
+you get all three, your infrastructure is sound and the production config will behave.
+
+---
+
+## 7. Reading the results
 
 Each run directory holds:
 
@@ -294,7 +623,7 @@ latencies.
 
 ---
 
-## 7. Teardown — do not skip this
+## 8. Teardown — do not skip this
 
 ```bash
 ./scripts/99-teardown.sh              # AWS: RCU to 10, stop the instance
@@ -337,7 +666,7 @@ instance termination and are the usual thing left billing.
 
 ---
 
-## 8. Troubleshooting
+## 9. Troubleshooting
 
 Every entry here is something that actually happened, with the diagnosis that resolved it.
 
@@ -417,7 +746,7 @@ entry is inert in Testcontainers 1.20.4.
 
 ---
 
-## 9. Changing the test
+## 10. Changing the test
 
 | Want to | Change |
 |---|---|
@@ -438,7 +767,7 @@ capacity arithmetic among them.
 
 ---
 
-## 10. Getting help from the artifacts
+## 11. Getting help from the artifacts
 
 If a run behaves strangely and the log does not explain it, the raw record log usually does. It
 holds every request with its start offset, latency, consumed capacity, thread id, phase and
