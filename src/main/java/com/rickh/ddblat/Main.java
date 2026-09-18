@@ -11,6 +11,7 @@ import com.rickh.ddblat.report.SummaryWriter;
 import com.rickh.ddblat.worker.*;
 import software.amazon.awssdk.regions.Region;
 import com.rickh.ddblat.provider.OciCredentials;
+import com.rickh.ddblat.provider.ScyllaCredentials;
 import com.rickh.ddblat.provider.Provider;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
 import software.amazon.awssdk.services.ec2.Ec2Client;
@@ -103,7 +104,13 @@ public final class Main {
         // AWS uses the default provider chain and the SDK's own endpoint resolution.
         java.net.URI endpoint = null;
         software.amazon.awssdk.auth.credentials.AwsCredentialsProvider creds = null;
-        if (cfg.provider() == Provider.OCI) {
+        if (cfg.provider() == Provider.SCYLLA) {
+            // BYOA gives you node addresses in a peered VPC, so the endpoint is configured whole
+            // rather than derived. Credentials are an Alternator role name and its salted_hash.
+            endpoint = java.net.URI.create(cfg.scyllaEndpoint());
+            creds = ScyllaCredentials.fromKeyFile(cfg.scyllaKeyFile());
+            System.out.println("PROVIDER: SCYLLA -- " + endpoint);
+        } else if (cfg.provider() == Provider.OCI) {
             endpoint = java.net.URI.create(
                 OciCredentials.endpointFor(cfg.region(), cfg.ociDatabaseOcid()));
             creds = OciCredentials.fromKeyFile(cfg.ociKeyFile());
@@ -230,13 +237,17 @@ public final class Main {
             }
 
             // ---- SWITCH ----
-            if (cfg.manageCapacity()) {
-                System.out.println("SWITCH: WCU -> 10, RCU -> " + cfg.readRcu());
-                admin.updateCapacity(cfg.readRcu(), 10);
-                admin.awaitActiveWithCapacity(cfg.readRcu(), 10, Duration.ofMinutes(30));
-            } else {
+            switch (cfg.capacityMode()) {
+                case SET -> {
+                    System.out.println("SWITCH: WCU -> 10, RCU -> " + cfg.readRcu());
+                    admin.updateCapacity(cfg.readRcu(), 10);
+                    admin.awaitActiveWithCapacity(cfg.readRcu(), 10, Duration.ofMinutes(30));
+                }
                 // The caller owns capacity across a whole series of runs; verify, do not set.
-                admin.requireCapacity(cfg.readRcu(), 10);
+                case VERIFY -> admin.requireCapacity(cfg.readRcu(), 10);
+                case SKIP -> System.out.println("SWITCH: no capacity change -- " + cfg.provider()
+                    + " has no provisioned throughput. readRcu=" + cfg.readRcu() + " is the rate "
+                    + "this run will drive, not a level the service enforces.");
             }
             // Settling runs either way: keeping every run in a series identical matters more
             // than the couple of minutes saved when capacity did not actually change.
@@ -305,18 +316,24 @@ public final class Main {
                     + "RCU 10 / WCU 10 so the account is not billed for load/read capacity "
                     + "indefinitely");
             }
-            if (cfg.manageCapacity()) {
-                try {
-                    admin.updateCapacity(10, 10);
-                    System.out.println("TEARDOWN: RCU -> 10, WCU -> 10");
-                } catch (Exception e) {
-                    System.err.println("TEARDOWN: failed to reset table capacity to RCU 10 / WCU "
-                        + "10 -- MANUAL INTERVENTION REQUIRED to stop ongoing billing: " + e);
+            switch (cfg.capacityMode()) {
+                case SET -> {
+                    try {
+                        admin.updateCapacity(10, 10);
+                        System.out.println("TEARDOWN: RCU -> 10, WCU -> 10");
+                    } catch (Exception e) {
+                        System.err.println("TEARDOWN: failed to reset table capacity to RCU 10 / "
+                            + "WCU 10 -- MANUAL INTERVENTION REQUIRED to stop ongoing billing: "
+                            + e);
+                    }
                 }
-            } else {
-                System.out.println("TEARDOWN: leaving capacity alone (manageCapacity=false) -- "
-                    + "the caller raised it for the whole series and is responsible for dropping "
-                    + "it when the series ends.");
+                case VERIFY -> System.out.println("TEARDOWN: leaving capacity alone "
+                    + "(manageCapacity=false) -- the caller raised it for the whole series and is "
+                    + "responsible for dropping it when the series ends.");
+                // Nothing to lower. Cost here is the cluster, which the harness never sized and
+                // must not pretend to release -- see the runbook's teardown section.
+                case SKIP -> System.out.println("TEARDOWN: no capacity to release on "
+                    + cfg.provider() + "; cluster cost is unaffected by this run ending.");
             }
             try {
                 writer.close();

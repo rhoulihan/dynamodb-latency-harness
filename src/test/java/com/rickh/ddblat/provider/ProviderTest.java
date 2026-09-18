@@ -22,7 +22,7 @@ class ProviderTest {
         // Silently falling back to AWS would run the whole test against the wrong service.
         assertThatThrownBy(() -> Provider.parse("azure"))
             .isInstanceOf(IllegalArgumentException.class)
-            .hasMessageContaining("aws or oci");
+            .hasMessageContaining("aws, oci or scylla");
     }
 
     @Test void awsReportsCapacityAndHasCloudWatch() {
@@ -68,5 +68,59 @@ class ProviderTest {
         // label AND charge 7.5 capacity units for work that cost 15, inflating achieved
         // throughput by 2x.
         assertThat(Provider.OCI.hasEventuallyConsistentReads()).isFalse();
+    }
+
+    // ---- ScyllaDB Alternator --------------------------------------------------------------
+
+    @Test
+    void parsesScyllaByTheNamesAnOperatorWouldType() {
+        assertThat(Provider.parse("scylla")).isEqualTo(Provider.SCYLLA);
+        assertThat(Provider.parse("ScyllaDB")).isEqualTo(Provider.SCYLLA);
+        assertThat(Provider.parse(" alternator ")).isEqualTo(Provider.SCYLLA);
+    }
+
+    @Test
+    void scyllaHasNoProvisionedCapacityToTarget() {
+        // Alternator accepts BillingMode and ProvisionedThroughput but ignores them, behaving
+        // like PAY_PER_REQUEST with no per-table cap. There is nothing to set, nothing to take
+        // 90% of, and nothing to reset at teardown.
+        assertThat(Provider.SCYLLA.hasProvisionedCapacity()).isFalse();
+        assertThat(Provider.AWS.hasProvisionedCapacity()).isTrue();
+        assertThat(Provider.OCI.hasProvisionedCapacity()).isTrue();
+    }
+
+    @Test
+    void scyllaEnforcesNoThrottlingSoThatCriterionCannotBeEarned() {
+        // "Throttle events do not occur in Alternator because per-table throughput limits are
+        // not enforced." A validity criterion that always passes is worse than no criterion --
+        // it certifies something it never checked -- so this must read NOT APPLICABLE.
+        assertThat(Provider.SCYLLA.enforcesThrottling()).isFalse();
+        assertThat(Provider.AWS.enforcesThrottling()).isTrue();
+        assertThat(Provider.OCI.enforcesThrottling()).isTrue();
+    }
+
+    @Test
+    void scyllaHasARealEventuallyConsistentReadPath() {
+        // Unlike Oracle: eventually-consistent reads use LOCAL_ONE, strongly-consistent use
+        // LOCAL_QUORUM. They are genuinely different operations, so the R-B phase is meaningful.
+        assertThat(Provider.SCYLLA.hasEventuallyConsistentReads()).isTrue();
+    }
+
+    @Test
+    void scyllaReportsNoConsumedCapacitySoTheSizeModelCarriesIt() {
+        assertThat(Provider.SCYLLA.reportsConsumedCapacity()).isFalse();
+        assertThat(Provider.SCYLLA.canVerifySizeModel()).isFalse();
+        assertThat(Provider.SCYLLA.hasCloudWatch()).isFalse();
+    }
+
+    @Test
+    void scyllaSignsWithTheConfiguredRegionLikeAws() {
+        // Standard SigV4. Only Oracle pins a region the service demands.
+        assertThat(Provider.SCYLLA.signingRegion()).isNull();
+    }
+
+    @Test
+    void everyProviderBindsToTheSameItemCeiling() {
+        assertThat(Provider.SCYLLA.maxItemBytes()).isEqualTo(Provider.AWS.maxItemBytes());
     }
 }

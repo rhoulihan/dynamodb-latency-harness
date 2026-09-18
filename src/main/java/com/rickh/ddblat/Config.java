@@ -15,7 +15,8 @@ public record Config(String table, String region, int itemCount, long loadWcu, l
                      Path resultsDir, String s3Bucket, String s3Prefix,
                      Path checkpointFile, boolean selfStop, Path harnessLogFile,
                      boolean skipLoad, boolean manageCapacity,
-                     Provider provider, String ociDatabaseOcid, Path ociKeyFile) {
+                     Provider provider, String ociDatabaseOcid, Path ociKeyFile,
+                     String scyllaEndpoint, Path scyllaKeyFile) {
 
     public static Config load(Path file) throws IOException {
         Properties p = new Properties();
@@ -143,6 +144,29 @@ public record Config(String table, String region, int itemCount, long loadWcu, l
         }
         Path ociKeyFile = ociKeyFileRaw == null ? null : Path.of(ociKeyFileRaw);
 
+        // --- scylla ----------------------------------------------------------------------------
+        // ScyllaDB Alternator is reached by full endpoint URL rather than assembled from a
+        // region and an id: on Bring-Your-Own-Account the cluster is a set of nodes in a peered
+        // VPC, so the address is whatever ScyllaDB Cloud allocated and there is nothing to derive.
+        String scyllaEndpoint = p.getProperty("scyllaEndpoint");
+        String scyllaKeyFileRaw = p.getProperty("scyllaKeyFile");
+        if (provider == Provider.SCYLLA) {
+            if (scyllaEndpoint == null || scyllaEndpoint.isBlank()) {
+                throw new IllegalArgumentException(
+                    "provider=scylla requires scyllaEndpoint, the full Alternator URL "
+                    + "(e.g. https://node-0.example.scylladb.com:8043)");
+            }
+            // Fail here rather than at the first request: a schemeless endpoint is the likely
+            // paste error and the SDK's own failure does not name the cause.
+            com.rickh.ddblat.provider.ScyllaCredentials.validateEndpoint(scyllaEndpoint);
+            if (scyllaKeyFileRaw == null || scyllaKeyFileRaw.isBlank()) {
+                throw new IllegalArgumentException(
+                    "provider=scylla requires scyllaKeyFile: a JSON file holding the role name as "
+                    + "access_key_id and its salted_hash as secret_access_key");
+            }
+        }
+        Path scyllaKeyFile = scyllaKeyFileRaw == null ? null : Path.of(scyllaKeyFileRaw);
+
         return new Config(
             table, region, itemCount,
             loadWcu, presplitWcu,
@@ -168,7 +192,8 @@ public record Config(String table, String region, int itemCount, long loadWcu, l
             // every test needs a harmless value that will simply never exist.
             Path.of(p.getProperty("harnessLogFile", "/var/log/ddblat.log")),
             skipLoad, manageCapacity,
-            provider, ociDatabaseOcid, ociKeyFile);
+            provider, ociDatabaseOcid, ociKeyFile,
+            scyllaEndpoint, scyllaKeyFile);
     }
 
     private static String require(Properties p, String key) {
@@ -177,5 +202,32 @@ public record Config(String table, String region, int itemCount, long loadWcu, l
             throw new IllegalArgumentException("missing required config key: " + key);
         }
         return v.trim();
+    }
+
+    /** What a run should do about provisioned capacity. See {@link #capacityMode()}. */
+    public enum CapacityMode {
+        /** Issue the UpdateTable calls that move capacity to the configured level. */
+        SET,
+        /** Do not set it, but assert it is already right before driving load against it. */
+        VERIFY,
+        /** The service has no provisioned capacity; touching or checking it is meaningless. */
+        SKIP
+    }
+
+    /**
+     * The single statement of when a run sets capacity, verifies it, or ignores it.
+     *
+     * Two independent inputs, asked at two call sites (SWITCH and TEARDOWN), which is exactly the
+     * shape that has produced bugs in this codebase before -- so it is stated once here and both
+     * sites ask it rather than carrying their own copy.
+     *
+     * SKIP is not "VERIFY, but lazier". On a provider without provisioned capacity, verification
+     * is actively misleading: DescribeTable echoes back whatever ProvisionedThroughput was named
+     * at create time, so a check would compare a configured number against itself and pass while
+     * testing nothing about the service.
+     */
+    public CapacityMode capacityMode() {
+        if (!provider.hasProvisionedCapacity()) return CapacityMode.SKIP;
+        return manageCapacity ? CapacityMode.SET : CapacityMode.VERIFY;
     }
 }

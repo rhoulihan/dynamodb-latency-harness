@@ -18,7 +18,7 @@ package com.rickh.ddblat.provider;
 public enum Provider {
 
     /** Amazon DynamoDB. Reports consumed capacity; CloudWatch cross-check available. */
-    AWS(true, true, 400 * 1024, true),
+    AWS(true, true, 400 * 1024, true, true, true),
 
     /**
      * Oracle Autonomous AI Database API for DynamoDB.
@@ -27,20 +27,70 @@ public enum Provider {
      * Oracle accepted a 450 KiB item in testing: the point of the comparison is identical
      * payloads, so the stricter of the two limits is the one that binds.
      */
-    OCI(false, false, 400 * 1024, false);
+    OCI(false, false, 400 * 1024, false, true, true),
+
+    /**
+     * ScyllaDB Alternator — the DynamoDB-compatible API, on ScyllaDB Cloud or self-hosted.
+     *
+     * Differs from both other providers in a way that reaches the control loop rather than just
+     * the client. Alternator has NO provisioned-throughput model: per the compatibility
+     * documentation, "The BillingMode and ProvisionedThroughput options on a table need to be
+     * valid but are ignored", the service "behaves like DynamoDB's BillingMode=PAY_PER_REQUEST:
+     * All requests are accepted without a per-table throughput cap", and "Throttle events do not
+     * occur in Alternator because per-table throughput limits are not enforced."
+     *
+     * Two consequences, both expressed as flags below rather than as special cases in Main:
+     * there is no capacity to set, take a fraction of, or reset at teardown; and the zero-throttle
+     * validity criterion cannot be earned here, so it must read NOT APPLICABLE rather than pass.
+     * The real overload signal is the server-side counter scylla_alternator_requests_shed.
+     *
+     * On the other side of the ledger it is closer to DynamoDB than Oracle is: SigV4 signing
+     * works normally, parallel Scan's Segment/TotalSegments is supported and tested upstream, and
+     * eventually-consistent reads are a genuinely distinct operation (LOCAL_ONE against
+     * LOCAL_QUORUM for strong), so the R-B phase measures something real.
+     */
+    SCYLLA(false, false, 400 * 1024, true, false, false);
 
     private final boolean reportsConsumedCapacity;
     private final boolean hasCloudWatch;
     private final int maxItemBytes;
     private final boolean hasEventuallyConsistentReads;
+    private final boolean hasProvisionedCapacity;
+    private final boolean enforcesThrottling;
 
     Provider(boolean reportsConsumedCapacity, boolean hasCloudWatch, int maxItemBytes,
-             boolean hasEventuallyConsistentReads) {
+             boolean hasEventuallyConsistentReads, boolean hasProvisionedCapacity,
+             boolean enforcesThrottling) {
         this.reportsConsumedCapacity = reportsConsumedCapacity;
         this.hasCloudWatch = hasCloudWatch;
         this.maxItemBytes = maxItemBytes;
         this.hasEventuallyConsistentReads = hasEventuallyConsistentReads;
+        this.hasProvisionedCapacity = hasProvisionedCapacity;
+        this.enforcesThrottling = enforcesThrottling;
     }
+
+    /**
+     * Whether the service has settable provisioned capacity at all.
+     *
+     * Distinct from {@code Config.manageCapacity()}, which asks whether THIS RUN should manage
+     * capacity or leave it to a caller orchestrating a series. This asks whether capacity is a
+     * thing on the service in the first place. False means every UpdateTable is pointless: the
+     * SWITCH between write and read capacity does nothing, teardown has nothing to lower, and
+     * targetFraction has no denominator -- so loadWcu/readRcu become the absolute rate the run
+     * intends to drive rather than a fraction of what was bought.
+     */
+    public boolean hasProvisionedCapacity() { return hasProvisionedCapacity; }
+
+    /**
+     * Whether the service throttles a table that exceeds its provisioned rate.
+     *
+     * False makes the zero-throttle validity criterion unearnable: no request can ever be
+     * throttled, so the check passes without testing anything. A gate that always passes is
+     * worse than no gate, because it certifies a property it never examined -- so a provider
+     * with this false must report that criterion NOT APPLICABLE and rely on a service-side
+     * overload signal instead.
+     */
+    public boolean enforcesThrottling() { return enforcesThrottling; }
 
     /**
      * Whether an eventually consistent read is a distinct operation on this service.
@@ -93,8 +143,9 @@ public enum Provider {
         return switch (s.trim().toLowerCase()) {
             case "aws", "dynamodb"  -> AWS;
             case "oci", "oracle", "adb" -> OCI;
+            case "scylla", "scylladb", "alternator" -> SCYLLA;
             default -> throw new IllegalArgumentException(
-                "unknown provider '" + s + "': expected aws or oci");
+                "unknown provider '" + s + "': expected aws, oci or scylla");
         };
     }
 }
