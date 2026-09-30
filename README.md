@@ -55,6 +55,8 @@ LOAD      write the dataset at 90% of provisioned WCU, measure PutItem
 SWITCH    drop WCU to minimum, raise RCU, settle 5 minutes
 R-A       strongly consistent GetItem at 90% of provisioned RCU
 R-B       eventually consistent GetItem      (skipped where the service has no such path)
+BATCH     optional (batchOps=true): BatchGetItem strong + eventual, BatchWriteItem x25,
+          TransactWriteItems up to x100 -- latency recorded per call
 TEARDOWN  capacity back to minimum, upload artifacts, stop the client
 ```
 
@@ -191,6 +193,7 @@ teardown strands the table at full capacity partway through a series.
 | `conf/focused.properties` | AWS read-only re-run concentrating load onto a subset of partitions |
 | `conf/oci-smoke.properties` | short OCI rehearsal |
 | `conf/oci-prod.properties` | the full OCI measurement |
+| `conf/meli-{370,523,2000,10000,50000}.properties` | MELI PoC: same request rates at five item sizes, all operation types |
 
 Selected keys:
 
@@ -204,6 +207,10 @@ Selected keys:
 | `readSegmentsTotal` / `readSegmentsUsed` | segment-scoped reads; 0 disables |
 | `skipLoad` | read-only re-run against an already-loaded table |
 | `manageCapacity` | false hands capacity control to the caller for a multi-run series |
+| `itemSize` | bytes per item, exact; defaults to 60,416 (59 KiB) |
+| `batchOps` | adds the BatchGetItem / BatchWriteItem / TransactWriteItems phases |
+| `batchGetSize` / `batchWriteSize` / `txnItems` | keys per call: ≤100 / ≤25 / ≤100 (transactions also clamp to 4 MB, so 83 at 50 KB) |
+| `batchWriteWcu` / `txnWcu` | pacing ceilings for the two batch-write phases; the table holds the larger from SWITCH on |
 
 ---
 

@@ -19,6 +19,14 @@ public final class ItemSizeModel {
     public static final int  FIXED_OVERHEAD = 222;                  // 15 scalars + 5 blob names
     public static final long DATASET_BYTES  = 126_701_535_232L;     // exactly 118 GiB
 
+    /** 5 blobs of at least one character each on top of the fixed scalar overhead. */
+    public static final int  MIN_ITEM_SIZE  = FIXED_OVERHEAD + 5;
+    /** DynamoDB's hard item-size ceiling. */
+    public static final int  MAX_ITEM_SIZE  = 400 * 1024;
+    /** TransactWriteItems: at most 100 actions and 4 MB aggregate. */
+    public static final int  MAX_TXN_ACTIONS = 100;
+    public static final int  MAX_TXN_BYTES   = 4 * 1024 * 1024;
+
     private static final int[] PERM = buildPermutation();
 
     private ItemSizeModel() {}
@@ -55,6 +63,31 @@ public final class ItemSizeModel {
 
     public static int blobPayloadBytes(int sizeBytes) {
         return sizeBytes - FIXED_OVERHEAD;
+    }
+
+    /**
+     * Rejects a size the item template cannot be built at. Below MIN_ITEM_SIZE there is no room
+     * for the blobs after the fixed scalars; above MAX_ITEM_SIZE DynamoDB refuses the write.
+     */
+    public static int validateItemSize(int sizeBytes) {
+        if (sizeBytes < MIN_ITEM_SIZE || sizeBytes > MAX_ITEM_SIZE) {
+            throw new IllegalArgumentException("itemSize must be in [" + MIN_ITEM_SIZE + ", "
+                + MAX_ITEM_SIZE + "] bytes, got " + sizeBytes);
+        }
+        return sizeBytes;
+    }
+
+    public static long datasetBytes(int itemCount, int sizeBytes) {
+        return (long) itemCount * sizeBytes;
+    }
+
+    /**
+     * Largest atomic batch TransactWriteItems will accept at this item size: 100 actions, but
+     * also 4 MB aggregate -- so 50 KB items cap at 83, not 100. Asking for more is not throttled,
+     * it is rejected outright with a ValidationException.
+     */
+    public static int maxItemsPerTransaction(int sizeBytes) {
+        return Math.max(1, Math.min(MAX_TXN_ACTIONS, MAX_TXN_BYTES / sizeBytes));
     }
 
     public static int writeCapacityUnits(int sizeBytes) {
