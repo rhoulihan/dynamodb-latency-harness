@@ -35,7 +35,11 @@ public final class Main {
 
     private static final byte LOAD_RAMP = 0, LOAD_WIN = 1,
                               RA_RAMP   = 2, RA_WIN   = 3,
-                              RB_RAMP   = 4, RB_WIN   = 5;
+                              RB_RAMP   = 4, RB_WIN   = 5,
+                              BGS_RAMP  = 6, BGS_WIN  = 7,
+                              BGE_RAMP  = 8, BGE_WIN  = 9,
+                              BW_RAMP   = 10, BW_WIN  = 11,
+                              TW_RAMP   = 12, TW_WIN  = 13;
 
     /** The run succeeded and results are complete on local disk, but the S3 upload failed. */
     private static final int S3_UPLOAD_FAILED_EXIT_CODE = 3;
@@ -96,7 +100,9 @@ public final class Main {
         long runStart = System.nanoTime();
         var cpu = cpuSupplier();
         KeySpace keys = new KeySpace(cfg.itemCount());
-        ItemTemplateFactory factory = new ItemTemplateFactory(20260908L);
+        ItemTemplateFactory factory = new ItemTemplateFactory(20260908L, cfg.itemSize());
+        System.out.println("ITEM-SIZE: " + cfg.itemSize() + " bytes x " + cfg.itemCount()
+            + " items = " + ItemSizeModel.datasetBytes(cfg.itemCount(), cfg.itemSize()) + " bytes");
         ClientSettings settings = ClientSettings.forThreads(cfg.maxThreads());
         // Both providers speak the same wire protocol, so the only differences are the endpoint
         // and where credentials come from. Oracle's Autonomous AI Database exposes a
@@ -239,12 +245,12 @@ public final class Main {
             // ---- SWITCH ----
             switch (cfg.capacityMode()) {
                 case SET -> {
-                    System.out.println("SWITCH: WCU -> 10, RCU -> " + cfg.readRcu());
-                    admin.updateCapacity(cfg.readRcu(), 10);
-                    admin.awaitActiveWithCapacity(cfg.readRcu(), 10, Duration.ofMinutes(30));
+                    System.out.println("SWITCH: WCU -> " + cfg.postLoadWcu() + ", RCU -> " + cfg.readRcu());
+                    admin.updateCapacity(cfg.readRcu(), cfg.postLoadWcu());
+                    admin.awaitActiveWithCapacity(cfg.readRcu(), cfg.postLoadWcu(), Duration.ofMinutes(30));
                 }
                 // The caller owns capacity across a whole series of runs; verify, do not set.
-                case VERIFY -> admin.requireCapacity(cfg.readRcu(), 10);
+                case VERIFY -> admin.requireCapacity(cfg.readRcu(), cfg.postLoadWcu());
                 case SKIP -> System.out.println("SWITCH: no capacity change -- " + cfg.provider()
                     + " has no provisioned throughput. readRcu=" + cfg.readRcu() + " is the rate "
                     + "this run will drive, not a level the service enforces.");
@@ -286,7 +292,7 @@ public final class Main {
 
             // ---- R-A: strongly consistent ----
             summaries.add(runPhase("R-A-strong", cfg, ddb, writer, cpu, runStart,
-                new GetWorkload(ddb, cfg.table(), keys, true, RA_RAMP),
+                new GetWorkload(ddb, cfg.table(), keys, true, RA_RAMP, cfg.itemSize()),
                 raSource, cfg.readRcu(), RA_RAMP, RA_WIN, cfg.windowDuration(),
                 null));
 
@@ -296,13 +302,39 @@ public final class Main {
             // them at half cost -- see Provider.hasEventuallyConsistentReads().
             if (cfg.provider().hasEventuallyConsistentReads()) {
                 summaries.add(runPhase("R-B-eventual", cfg, ddb, writer, cpu, runStart,
-                    new GetWorkload(ddb, cfg.table(), keys, false, RB_RAMP),
+                    new GetWorkload(ddb, cfg.table(), keys, false, RB_RAMP, cfg.itemSize()),
                     rbSource, cfg.readRcu(), RB_RAMP, RB_WIN, cfg.windowDuration(),
                     null));
             } else {
                 System.out.println("R-B-eventual: SKIPPED -- " + cfg.provider()
                     + " has no eventually consistent read path; ConsistentRead=false returns the "
                     + "same strongly consistent result, so the phase would measure R-A twice.");
+            }
+
+            // ---- Batch operations (MELI PoC) ----
+            // Latency per CALL, which is what the bulk/batch SLA is stated against. Keys are
+            // allocated in disjoint blocks by the workloads themselves, so the read cycle's
+            // index source only paces; segment-scoped selection does not apply here.
+            if (cfg.batchOps()) {
+                summaries.add(runPhase("BG-strong-" + cfg.batchGetSize(), cfg, ddb, writer, cpu, runStart,
+                    new BatchGetWorkload(ddb, cfg.table(), keys, cfg.batchGetSize(), true, BGS_RAMP, cfg.itemSize()),
+                    ReadPhase.cycleSource(keys), cfg.readRcu(), BGS_RAMP, BGS_WIN, cfg.windowDuration(), null));
+                if (cfg.provider().hasEventuallyConsistentReads()) {
+                    summaries.add(runPhase("BG-eventual-" + cfg.batchGetSize(), cfg, ddb, writer, cpu, runStart,
+                        new BatchGetWorkload(ddb, cfg.table(), keys, cfg.batchGetSize(), false, BGE_RAMP, cfg.itemSize()),
+                        ReadPhase.cycleSource(keys), cfg.readRcu(), BGE_RAMP, BGE_WIN, cfg.windowDuration(), null));
+                }
+                summaries.add(runPhase("BW-" + cfg.batchWriteSize(), cfg, ddb, writer, cpu, runStart,
+                    new BatchPutWorkload(ddb, cfg.table(), keys, cfg.batchWriteSize(), factory, BW_RAMP),
+                    ReadPhase.cycleSource(keys), cfg.batchWriteWcu(), BW_RAMP, BW_WIN, cfg.windowDuration(), null));
+                TransactWriteWorkload tw = new TransactWriteWorkload(
+                    ddb, cfg.table(), keys, cfg.txnItems(), factory, TW_RAMP);
+                if (tw.itemsPerTransaction() < cfg.txnItems()) {
+                    System.out.println("TW: clamped " + cfg.txnItems() + " -> " + tw.itemsPerTransaction()
+                        + " items per transaction (4 MB aggregate limit at " + cfg.itemSize() + " bytes)");
+                }
+                summaries.add(runPhase("TW-" + tw.itemsPerTransaction(), cfg, ddb, writer, cpu, runStart,
+                    tw, ReadPhase.cycleSource(keys), cfg.txnWcu(), TW_RAMP, TW_WIN, cfg.windowDuration(), null));
             }
 
             success = true;

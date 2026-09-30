@@ -14,9 +14,16 @@ public final class GetWorkload implements Workload {
     private final KeySpace keys;
     private final boolean consistentRead;
     private final byte phaseId;
+    private final int itemSize;
 
     public GetWorkload(DynamoDbClient ddb, String table, KeySpace keys,
                        boolean consistentRead, byte phaseId) {
+        this(ddb, table, keys, consistentRead, phaseId, ItemSizeModel.ITEM_SIZE);
+    }
+
+    public GetWorkload(DynamoDbClient ddb, String table, KeySpace keys,
+                       boolean consistentRead, byte phaseId, int itemSize) {
+        this.itemSize = ItemSizeModel.validateItemSize(itemSize);
         this.ddb = ddb;
         this.table = table;
         this.keys = keys;
@@ -55,17 +62,14 @@ public final class GetWorkload implements Workload {
 
     @Override
     public double estimatedCapacityUnits(int index) {
-        int size = ItemSizeModel.sizeForKey(index);
-        return consistentRead
-            ? ItemSizeModel.readCapacityUnitsStrong(size)
-            : ItemSizeModel.readCapacityUnitsEventual(size);
+        return maxCapacityUnits();
     }
 
     @Override
     public double maxCapacityUnits() {
         return consistentRead
-            ? ItemSizeModel.readCapacityUnitsStrong(ItemSizeModel.ITEM_SIZE)
-            : ItemSizeModel.readCapacityUnitsEventual(ItemSizeModel.ITEM_SIZE);
+            ? ItemSizeModel.readCapacityUnitsStrong(itemSize)
+            : ItemSizeModel.readCapacityUnitsEventual(itemSize);
     }
 
     @Override

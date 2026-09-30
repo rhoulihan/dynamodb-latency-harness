@@ -49,12 +49,12 @@ public final class PutWorkload implements Workload {
 
     @Override
     public double estimatedCapacityUnits(int index) {
-        return ItemSizeModel.writeCapacityUnits(ItemSizeModel.sizeForKey(index));
+        return maxCapacityUnits();
     }
 
     @Override
     public double maxCapacityUnits() {
-        return ItemSizeModel.writeCapacityUnits(ItemSizeModel.ITEM_SIZE);
+        return ItemSizeModel.writeCapacityUnits(factory.itemSize());
     }
 
     @Override

@@ -23,14 +23,26 @@ public final class ItemTemplateFactory {
     private static final int BLOB_COUNT = 5;
 
     private final Map<String, AttributeValue>[] templates;
+    private final int itemSize;
+
+    /** The original fixed 59 KiB item. */
+    public ItemTemplateFactory(long seed) {
+        this(seed, ItemSizeModel.ITEM_SIZE);
+    }
 
     @SuppressWarnings("unchecked")
-    public ItemTemplateFactory(long seed) {
+    public ItemTemplateFactory(long seed, int itemSize) {
+        this.itemSize = ItemSizeModel.validateItemSize(itemSize);
         this.templates = new Map[ItemSizeModel.TEMPLATE_COUNT];
         RandomGenerator rng = new java.util.SplittableRandom(seed);
         for (int j = 0; j < templates.length; j++) {
             templates[j] = buildTemplate(j, rng);
         }
+    }
+
+    /** Exact DynamoDB size, in bytes, of every item this factory produces. */
+    public int itemSize() {
+        return itemSize;
     }
 
     /** The 19 non-key attributes for template j. Same instance on every call. */
@@ -47,7 +59,7 @@ public final class ItemTemplateFactory {
     }
 
     private Map<String, AttributeValue> buildTemplate(int j, RandomGenerator rng) {
-        int payload = ItemSizeModel.blobPayloadBytes(ItemSizeModel.sizeForTemplate(j));
+        int payload = ItemSizeModel.blobPayloadBytes(itemSize);
         Map<String, AttributeValue> m = new LinkedHashMap<>(32);
 
         m.put("ver",      AttributeValue.fromN("1"));

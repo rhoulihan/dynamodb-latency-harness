@@ -3,11 +3,14 @@
 
 layout: 0 int64 startNanos | 8 int64 latencyNanos | 16 int32 cuX100
         20 int16 threadId  | 22 int8 phaseId      | 23 int8 packed
-Window phase ids are the odd ones: 1=LOAD, 3=R-A-strong, 5=R-B-eventual.
+Window phase ids are the odd ones: 1=LOAD, 3=R-A-strong, 5=R-B-eventual,
+7=BG-strong, 9=BG-eventual, 11=BW (BatchWriteItem), 13=TW (TransactWriteItems).
+Batch phase names in summary.json carry the batch size as a suffix (BG-strong-100, TW-83).
 """
 import gzip, struct, sys, json, os, array
 
-WINDOW = {1: "LOAD", 3: "R-A-strong", 5: "R-B-eventual"}
+WINDOW = {1: "LOAD", 3: "R-A-strong", 5: "R-B-eventual",
+          7: "BG-strong", 9: "BG-eventual", 11: "BW", 13: "TW"}
 
 def percentiles(path, pcts):
     raw = gzip.open(path, "rb").read()
@@ -51,8 +54,9 @@ if __name__ == "__main__":
     for name, r in got.items():
         print(f"  {name:<14}{r['count']:>10,}" + "".join(f"{r[p]:>9,.0f}" if p < 99.9 else f"{r[p]:>10,.0f}" for p in pcts))
         print(f"  {'  mean CU/req':<14}{res_cu(got,name):>10}")
-        if name in ref:
-            k = ref[name]
+        match = next((n for n in ref if n == name or n.startswith(name + "-")), None)
+        if match:
+            k = ref[match]
             print(f"  {'  summary.json':<14}{k['count']:>10,}{k['p50']:>9,.0f}{k['p90']:>9,.0f}{'--':>9}"
                   f"{k['p99']:>9,.0f}{k['p999']:>10,.0f}{k['p9999']:>10,.0f}")
             worst = max(abs(got[name][p] - k[j]) / k[j] * 100

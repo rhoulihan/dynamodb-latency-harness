@@ -16,7 +16,9 @@ public record Config(String table, String region, int itemCount, long loadWcu, l
                      Path checkpointFile, boolean selfStop, Path harnessLogFile,
                      boolean skipLoad, boolean manageCapacity,
                      Provider provider, String ociDatabaseOcid, Path ociKeyFile,
-                     String scyllaEndpoint, Path scyllaKeyFile) {
+                     String scyllaEndpoint, Path scyllaKeyFile,
+                     int itemSize, boolean batchOps, int batchGetSize, int batchWriteSize,
+                     int txnItems, long batchWriteWcu, long txnWcu) {
 
     public static Config load(Path file) throws IOException {
         Properties p = new Properties();
@@ -167,6 +169,41 @@ public record Config(String table, String region, int itemCount, long loadWcu, l
         }
         Path scyllaKeyFile = scyllaKeyFileRaw == null ? null : Path.of(scyllaKeyFileRaw);
 
+        // --- itemSize ----------------------------------------------------------------------------
+        // Every item is exactly this many bytes. Defaults to the original 59 KiB so existing
+        // configs are unchanged. The MELI PoC runs the same harness at 370, 523, 2,000, 10,000
+        // and 50,000 bytes; the template builder and every workload's capacity accounting follow.
+        int itemSize = com.rickh.ddblat.model.ItemSizeModel.validateItemSize(Integer.parseInt(
+            p.getProperty("itemSize", Integer.toString(com.rickh.ddblat.model.ItemSizeModel.ITEM_SIZE)).trim()));
+
+        // --- batch operations --------------------------------------------------------------------
+        // After the single-item read phases: BatchGetItem (strong and eventual), a full
+        // BatchWriteItem, and TransactWriteItems. Off by default. The write phases overwrite
+        // existing keys at the same size, so the dataset is unchanged by them.
+        boolean batchOps = Boolean.parseBoolean(p.getProperty("batchOps", "false"));
+        int batchGetSize = Integer.parseInt(p.getProperty("batchGetSize", "100").trim());
+        int batchWriteSize = Integer.parseInt(p.getProperty("batchWriteSize", "25").trim());
+        int txnItems = Integer.parseInt(p.getProperty("txnItems", "100").trim());
+        if (batchGetSize < 1 || batchGetSize > 100) {
+            throw new IllegalArgumentException("batchGetSize must be in [1,100], got " + batchGetSize);
+        }
+        if (batchWriteSize < 1 || batchWriteSize > 25) {
+            throw new IllegalArgumentException("batchWriteSize must be in [1,25], got " + batchWriteSize);
+        }
+        if (txnItems < 1 || txnItems > 100) {
+            throw new IllegalArgumentException("txnItems must be in [1,100], got " + txnItems);
+        }
+        // Pacing ceilings for the two batch-write phases, in WCU. Separate because at fixed call
+        // rates they differ by an order of magnitude: a 25-item BatchWriteItem of 50 KB items is
+        // 1,225 WCU, an 83-item transaction of the same items is 8,134. The table holds the
+        // larger of the two from SWITCH onward -- see postLoadWcu().
+        long batchWriteWcu = Long.parseLong(p.getProperty("batchWriteWcu", "0").trim());
+        long txnWcu = Long.parseLong(p.getProperty("txnWcu", "0").trim());
+        if (batchOps && (batchWriteWcu <= 0 || txnWcu <= 0)) {
+            throw new IllegalArgumentException("batchOps=true requires batchWriteWcu > 0 and "
+                + "txnWcu > 0: the BatchWriteItem and TransactWriteItems phases are paced against them");
+        }
+
         return new Config(
             table, region, itemCount,
             loadWcu, presplitWcu,
@@ -193,7 +230,13 @@ public record Config(String table, String region, int itemCount, long loadWcu, l
             Path.of(p.getProperty("harnessLogFile", "/var/log/ddblat.log")),
             skipLoad, manageCapacity,
             provider, ociDatabaseOcid, ociKeyFile,
-            scyllaEndpoint, scyllaKeyFile);
+            scyllaEndpoint, scyllaKeyFile,
+            itemSize, batchOps, batchGetSize, batchWriteSize, txnItems, batchWriteWcu, txnWcu);
+    }
+
+    /** WCU the table holds from SWITCH onward: enough for batch writes when they run, else 10. */
+    public long postLoadWcu() {
+        return batchOps ? Math.max(batchWriteWcu, txnWcu) : 10;
     }
 
     private static String require(Properties p, String key) {
