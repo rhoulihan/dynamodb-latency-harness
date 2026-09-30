@@ -24,6 +24,8 @@ ACCOUNT_ID=$(query "111122223333" aws sts get-caller-identity --query Account --
 BUCKET="ddblat-results-${ACCOUNT_ID}-${AWS_REGION}"
 TABLE_ARN_MAIN="arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/latency-test-100g"
 TABLE_ARN_SMOKE="arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/latency-test-smoke"
+# MELI PoC tables, one per item size (conf/meli-*.properties). Still scoped by name prefix.
+TABLE_ARN_MELI="arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/meli-*"
 
 state_put REGION      "$AWS_REGION"
 state_put ACCOUNT_ID  "$ACCOUNT_ID"
@@ -156,9 +158,11 @@ cat > "$POLICY" <<EOF
         "dynamodb:UpdateTable",
         "dynamodb:PutItem",
         "dynamodb:GetItem",
+        "dynamodb:BatchGetItem",
+        "dynamodb:BatchWriteItem",
         "dynamodb:Scan"
       ],
-      "Resource": ["$TABLE_ARN_MAIN", "$TABLE_ARN_SMOKE"]
+      "Resource": ["$TABLE_ARN_MAIN", "$TABLE_ARN_SMOKE", "$TABLE_ARN_MELI"]
     },
     {
       "Sid": "CloudWatchCrossCheck",
